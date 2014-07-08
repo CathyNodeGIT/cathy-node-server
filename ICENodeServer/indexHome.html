@@ -1,0 +1,61 @@
+<html>
+<head>
+    <title>Socket and Redis in Node.js</title>
+    <script src="http://localhost:8088/socket.io/socket.io.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/1.6.4/jquery.min.js"></script>
+</head>
+<body>
+<div id="username">
+    <input type="text" name="usernameTxt" /> <input type="button" name="setUsername" value="Set Username" />
+</div>
+<div id="roomid">
+    <input type="text" name="roomName" /> <input type="button" name="setRoomname" value="Set Roomname" />
+</div>
+<div id="sendChat" style="display:none;">
+    <input type="text" name="chatTxt" /> <input type="button" name="sendBtn" value="Send" />
+</div>
+<br />
+<div id="content"></div>
+<script>    
+    $(document).ready(function() {
+        var username = "anonymous";
+        $('input[name=setUsername]').click(function(){
+            if($('input[name=usernameTxt]').val() != ""){
+                username = $('input[name=usernameTxt]').val();
+                var msg = {type:'setUsername',user:username,roomid:$("input[name=roomName]").val()};
+                socket.json.send(msg);
+            }
+            $('#username').slideUp("slow",function(){
+                $('#sendChat').slideDown("slow");
+            });
+        });
+        var socket = new io.connect('http://localhost');
+        var content = $('#content');
+ 
+        socket.on('connect', function() {
+            console.log("Connected");
+        });
+ 
+        socket.on('message', function(message){
+		var msg=JSON.parse(message);
+		if (msg.roomid=="chatting" + $("input[name=roomName]").val())
+		{
+		
+            content.append(msg.message + '<br />');
+			}
+        }) ;
+ 
+        socket.on('disconnect', function() {
+            console.log('disconnected');
+            content.html("<b>Disconnected!</b>");
+        });
+ 
+        $("input[name=sendBtn]").click(function(){
+            var msg = {type:'chat',message:username + " : " +  $("input[name=chatTxt]").val(),roomid:$("input[name=roomName]").val()}
+            socket.json.send(msg);
+            $("input[name=chatTxt]").val("");
+        });
+    });
+</script>
+</body>
+</html>

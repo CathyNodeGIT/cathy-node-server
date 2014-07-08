@@ -1,0 +1,2219 @@
+package com.wowza.wms.plugin.etechchatDEBUG;
+
+import java.util.*;
+
+import com.microsoft.sqlserver.jdbc.SQLServerDataSource;
+import com.wowza.wms.application.*;
+import com.wowza.wms.amf.*;
+import com.wowza.wms.client.*;
+import com.wowza.wms.module.*;
+import com.wowza.wms.request.*;
+import com.wowza.wms.sharedobject.*;
+
+import java.util.Date;
+import java.text.SimpleDateFormat;
+import java.text.DateFormat;
+import java.util.TimeZone;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.sql.*;
+
+import sun.misc.Regexp;
+
+
+public class ModuleTextChat extends ModuleBase 
+{
+	private Map<String, AMFDataList> chatUserOjects = new HashMap<String, AMFDataList>();
+	private Map<String, HashMap<String, ChatStatistics>> chatStatistics = new HashMap<String, HashMap<String, ChatStatistics>>();
+	
+	private long nextChatId = 0; 
+	private long keepCount = 5;
+	private int purgeCount = 500;
+	  
+	public static String pattern = "\\d";
+	public static String Replacement = "X"; 
+	 
+	public static Integer  OPERATOR_LOGIN_STATE = 10;
+	public static Integer  OPERATOR_LOGOUT_STATE = 20;
+	public static Integer  OPERATOR_AVAILABLE_STATE = 30;
+	public static Integer  OPERATOR_NOTAVAILABLE_STATE=40 ;
+	public static Integer  OPERATOR_INCALL_STATE = 50;
+	public static Integer  OPERATOR_OUTCALL_STATE = 60;
+	public static Integer  OPERATOR_CALLSTARTED_STATE = 70;
+	public static Integer  OPERATOR_CALLSTARTED_TRANSFERRED_STATE = 71;// CallStarted-Transferred
+	public static Integer  OPERATOR_CALLTRANSFER_STARTED = 72;
+	public static Integer  OPERATOR_CALLTRANSFER_DEST_ACCEPTED = 73;
+	public static Integer  OPERATOR_CALLTRANSFER_DEST_REJECTED = 74;
+	public static Integer  OPERATOR_CALLTRANSFER_SOURCE_ACCEPTED = 75;
+	public static Integer  OPERATOR_CALLTRANSFER_SOURCE_REJECTED = 76;
+	public static Integer  OPERATOR_CALLTRANSFER_DEST_ABANDON = 77;
+	public static Integer  OPERATOR_CALLTRANSFER_SOURCE_ABANDON = 78;
+	public static Integer  OPERATOR_CALLHANGUP_STATE = 80;//CallHangUp
+	public static Integer  OPERATOR_CALLCOMPLETED_TRANSFERRED_STATE =81 ;//CallCompleted-Transferred
+	public static Integer  OPERATOR_CALLCOMPLETED_STATE = 90;//CallCompleted
+	
+	public static String OPERATOR_NOT_IN_CALL = "0";
+	 
+	public void initSharedObject(IClient client, RequestFunction function, AMFDataList params)
+	{
+		// make sure we create the shared object server side so we can initialize it properly
+		String soName = params.getString(PARAM1);
+		String UserName = params.getString(PARAM2);
+		String chatType = params.getString(PARAM3);
+		Boolean IsSupervisorChat = Boolean.parseBoolean(params.getString(PARAM4));
+		String RequestFrom = params.getString(PARAM5);
+		
+		if(soName == "" || soName == "Operator")
+			return;
+		
+		client.setSharedObjectWriteAccess(soName);
+		client.setSharedObjectReadAccess(soName);
+		
+		//getChatSharedObject(soName, UserName, client);
+		getChatSharedObject(soName, UserName, client, chatType);
+		
+		ISharedObjects chatSharedObjects = client.getAppInstance().getSharedObjects();
+	    if(chatSharedObjects.exists(soName))
+	    {
+	     ISharedObject sharedobject = chatSharedObjects.get(soName);
+	     sharedobject.setProperty("IsSupervisorChat",IsSupervisorChat);
+	     sharedobject.setProperty("RequestFrom",RequestFrom);
+	    }
+
+		sendResult(client, params, soName);
+		
+	}
+	
+	public void initSharedObjectSupervisor(IClient client, RequestFunction function, AMFDataList params)
+	 {
+	  // make sure we create the shared object server side so we can initialize it properly
+	  String soName = params.getString(PARAM1);
+	  Boolean IsSupervisorChat = Boolean.parseBoolean(params.getString(PARAM2));
+	  String RequestFrom = params.getString(PARAM3);
+	  
+	  if(soName == "" || soName == "Operator")
+	   return;
+	  
+	  client.setSharedObjectWriteAccess(soName);
+	  client.setSharedObjectReadAccess(soName);
+	  
+	  //getChatSharedObject(soName, UserName, client);
+	  getChatSharedObject(soName, "", client,"");
+
+	  ISharedObjects chatSharedObjects = client.getAppInstance().getSharedObjects();
+	  if(chatSharedObjects.exists(soName))
+	  {
+	   ISharedObject sharedobject = chatSharedObjects.get(soName);
+	   sharedobject.setProperty("IsSupervisorChat",IsSupervisorChat);
+	   sharedobject.setProperty("RequestFrom",RequestFrom);
+	  }
+	  
+	  sendResult(client, params, soName);
+	  
+	 }
+	
+	
+	private ISharedObject getChatSharedObject(String soName, String UserName, IClient client, String chatType)
+	{
+		getLogger().info("ModuleTextChatDebug.getChatSharedObject: soName :- " +soName);
+		getLogger().info("ModuleTextChatDebug.getChatSharedObject: UserName :- " +UserName);
+		ISharedObject ret = null;
+		ISharedObjects chatSharedObjects = client.getAppInstance().getSharedObjects();
+		if(!chatSharedObjects.exists(soName))
+		{
+			synchronized(chatSharedObjects)
+			{
+				getLogger().info("ModuleTextChatDebug.getChatSharedObject: create shared objects: "+soName);
+				
+				ret = chatSharedObjects.getOrCreate(soName);
+				
+				chatSharedObjects.put(soName, ret);
+				chatUserOjects.put(soName, new AMFDataList());
+				chatStatistics.put(soName, new HashMap<String, ChatStatistics>());
+				
+				
+				ret.setProperty("lastChatId", new AMFDataItem(nextChatId));
+				ret.acquire();
+				client.getProperties().put("soName", soName);
+				//update Operator status and start login time
+				if(soName.contains("Operator") == true && soName != "Operator")
+				{
+					getLogger().info("onNewOperatorObject: " + soName);
+					
+					if(ret.containsProperty("UserName") == false && UserName != "")
+						ret.setProperty("UserName", UserName);
+					
+					if(ret.containsProperty("TotalVistorConnetected") == false)
+					{
+						ret.setProperty("TotalVistorConnetected", 0);
+						ret.setProperty("ConnectedVisitorSO", "");
+					}
+					
+					//soName
+					
+					UpdateOperatorStatus(soName.substring(8),OPERATOR_LOGIN_STATE,"");
+					OperatorUpdate(Integer.parseInt(soName.substring(8)),client.getIp());
+					
+					String arraytimezone[] = GetTimeZone(Integer.parseInt(soName.substring(8)));
+					ret.setProperty("timeZoneName", arraytimezone[0]);
+					ret.setProperty("IsTimeSlabNeed", arraytimezone[1]);
+					
+				}
+			}
+		}
+		else
+		{
+			ret = chatSharedObjects.get(soName);
+		}
+		
+		//take this to a function later. It will be called from timer function from customer client
+		if(!soName.contains("Operator") && !ret.containsProperty("OperatorAssigned") && soName != "")
+		{
+			
+			getLogger().info("ModuleTextChatDebug:onNewCustomerObject: " + soName);
+
+			String OperatorID = GetOperator(soName);
+			getLogger().info("ModuleTextChatDebug.: OperatorID :- " + OperatorID);
+			if(OperatorID.equalsIgnoreCase("0"))
+			{
+				return ret; 
+			}
+			else if(UserName != "")
+			{
+				ret.setProperty("UserName", UserName);
+				ret.setProperty("OperatorAssigned", "true");
+				
+				ret.setProperty("IsOperatorCS", false);
+				ret.setProperty("IsVisitorCS", false);
+				ret.setProperty("CSStatus", false);
+				
+				ret.setProperty("ChatType", chatType);
+				
+				ret.setProperty("isCustomerHangupMsgSend", false);
+				ret.setProperty("isOperatorHangupMsgSend", false);
+				
+			}
+			
+			String OperatorSoName = "Operator" + OperatorID;
+			
+			// change this later on to make it work only for an operator's connection not over a customer's connection
+			ISharedObject operator_so = null;
+			
+			if(chatSharedObjects.exists(OperatorSoName))
+			{
+				operator_so = chatSharedObjects.get(OperatorSoName);
+				
+				ret.setProperty("timeZoneName",operator_so.getProperty("timeZoneName").toString());
+				ret.setProperty("IsTimeSlabNeed", operator_so.getProperty("IsTimeSlabNeed").toString());
+								
+			}
+			else
+			{
+				return ret;
+			}
+			
+			
+			String CustomerName = ret.getProperty("UserName").toString();
+			String OperatorName = operator_so.getProperty("UserName").toString();
+			
+			AMFDataObj amfDataObj = new AMFDataObj();
+			amfDataObj.put("message", new AMFDataItem(soName));
+			amfDataObj.put("time", new java.util.Date());
+			amfDataObj.put("user", new AMFDataItem(CustomerName));
+			amfDataObj.put("soName", new AMFDataItem(soName));
+			amfDataObj.put("IsTimeSlabNeed", new AMFDataItem(operator_so.getProperty("IsTimeSlabNeed").toString()));
+			amfDataObj.put("messagetype", new AMFDataItem("NewConnection"));
+			
+			AMFDataList list = new AMFDataList();
+			list.add("addMessage");
+			list.add(0.0);
+			list.add("null");
+			list.add(OperatorSoName);
+			list.add(amfDataObj);
+			
+			addMessage(client,null, list);
+			
+			
+			Double TotalConnectedVisitor =Double.parseDouble(operator_so.getProperty("TotalVistorConnetected").toString());
+			String ConnectedVisitorSO = operator_so.getProperty("ConnectedVisitorSO").toString();
+			
+			if(ConnectedVisitorSO == "")
+			{
+				//first so assigned
+				ConnectedVisitorSO = soName;
+			}else
+			{
+				ConnectedVisitorSO+= "," + soName;
+			}
+			TotalConnectedVisitor++;
+			
+			ret.setProperty("OperatorID", OperatorID);
+			ret.setProperty("OperatorName", OperatorName);
+			ret.setProperty("IsChatTransferred", false);
+			ret.setProperty("TransferredFlag", false);
+			
+			synchronized (operator_so) {
+			
+				operator_so.setProperty("TotalVistorConnetected", TotalConnectedVisitor);
+				operator_so.setProperty("ConnectedVisitorSO", ConnectedVisitorSO);
+			}
+			
+			
+			
+		}
+		
+		return ret;
+	}
+	
+	
+	@SuppressWarnings("unchecked")
+	public void addMessage(IClient client, RequestFunction function, AMFDataList params) 
+	{
+		String soName = params.getString(PARAM1);
+		AMFDataObj chatData = params.getObject(PARAM2);
+		ISharedObjects chatSharedObjects = client.getAppInstance().getSharedObjects();
+
+		if(soName == "undefined" || soName == null)
+			return;
+		
+		String messageSender = client.getPageUrl().toLowerCase();
+		
+		
+		getLogger().info("ModuleTextChatDebug.addMessage: soName :- " + soName);
+		getLogger().info("ModuleTextChatDebug.addMessage: messagetype :- " + chatData.getString("messagetype"));
+		getLogger().info("ModuleTextChatDebug.addMessage: " + client.getClientId());
+		getLogger().info("ModuleTextChatDebug.addMessage: " + client.getPageUrl());
+
+		ISharedObject textchat_so = chatSharedObjects.get(soName);
+		if(messageSender=="unknown")
+		{
+			String From= textchat_so.getProperty("RequestFrom").toString();
+			if(From.contains("null")== true)
+			{
+				messageSender="operatorinteraction";
+			}
+			else if(From.contains("supervisor")== true)
+			{
+				messageSender="supervisor";
+			}
+		}
+		if (textchat_so == null)
+			return;
+		
+		textchat_so.lock();
+		try
+		{
+			// add the chat item to the list
+			nextChatId++;
+			String propName = "chatData"+nextChatId;
+			
+			if(textchat_so.containsProperty("timeZoneName"))
+			{
+				DateFormat firstFormat =  new SimpleDateFormat("HH:mm:ss");
+				Date date = new Date();
+				
+				TimeZone firstTime = TimeZone.getTimeZone(textchat_so.getProperty("timeZoneName").toString());
+				firstFormat.setTimeZone(firstTime);					
+				String dt = firstFormat.format(date);
+				chatData.put("time", new AMFDataItem(dt));
+			}
+			
+			
+			chatData.put("Sender", new AMFDataItem("System"));
+			if(chatData.getString("messagetype").toString().equalsIgnoreCase("OperatorConnect") == true)
+			{
+				addMessageOperatorConnect(client, chatSharedObjects,soName, chatData, textchat_so);
+				String msg = chatData.getString("message");
+				chatData.put("OperatorConnect", new AMFDataItem(msg));
+				chatData.put("Sender", new AMFDataItem("System"));
+				//
+				//UpdateOperatorStatus(soName.substring(8),OPERATOR_CALLTRANSFER_DEST_ABANDON ,chatData.getString("message").toString());
+			}
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("GreetingMessage"))
+			{
+				String greeting = GetDefaultGreeting(soName);
+				
+					if(greeting == null || greeting.trim().isEmpty())
+					{
+						greeting = "Welcome to the site...";
+					}
+				chatData.put("message", new AMFDataItem(greeting));
+				chatData.put("Sender", new AMFDataItem("System"));
+				
+				if(!soName.contains("operator"))
+				{
+					client.getProperties().getPropertyBoolean("IsDisconnectedByTransfer", false);
+					textchat_so.setProperty("IsChatTransferred", false);
+				}
+				
+			}
+			
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("OperatorTransfer"))
+			{
+				UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_STARTED,chatData.getString("message").toString());
+				//UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_SOURCE_ABANDON,chatData.getString("message").toString());
+			}
+			
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferReject"))
+			{
+				UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_DEST_REJECTED,chatData.getString("message").toString());
+			}
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferAccept_Source"))
+			{ 
+				 
+				UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_SOURCE_ACCEPTED,chatData.getString("message").toString());
+				
+				/*
+				 * String sharedSoName = chatData.getString("message").toString();
+				getLogger().info("ModuleTextChatDebug.getChatSharedObject: sharedSoName : "+sharedSoName);
+				ISharedObject customerso = null;
+				customerso = chatSharedObjects.get(sharedSoName);
+				if(customerso != null){
+					 
+					String previousoperatorid = customerso.getProperty("OperatorID").toString();
+					String currentoperatorid = customerso.getProperty("TransferOperatorID").toString();
+					
+					getLogger().info("ModuleTextChatDebug.getChatSharedObject: previousoperatorid : "+previousoperatorid);
+					getLogger().info("ModuleTextChatDebug.getChatSharedObject: currentoperatorid : "+currentoperatorid);
+					
+				}else
+				{
+					getLogger().info("ModuleTextChatDebug.getChatSharedObject: sharedSoName IS NULL : ");
+				} 
+				
+				*/
+				
+				
+			}
+			
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferReject_Source"))
+			{
+				String CustomerSoName = chatData.getString("message");
+				ISharedObject customer_so = chatSharedObjects.get(CustomerSoName);
+
+				if(customer_so!=null)
+				{
+					customer_so.setProperty("IsChatTransferred", "false");
+				}
+				UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_SOURCE_REJECTED,chatData.getString("message").toString());
+			}
+			
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("OperatorReject"))
+			{
+				addMessageOperatorReject(soName, chatData, textchat_so);
+			}
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferAccept"))
+			{
+				//TODO: 
+				addMessageTransferAccept(chatData, chatSharedObjects ,textchat_so);
+				UpdateOperatorStatus(chatData.getString("transferringoperator").substring(8),OPERATOR_CALLTRANSFER_DEST_ACCEPTED,chatData.getString("message").toString());
+			}
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferConnection"))
+			{
+				addMessageTransferConnection(soName, chatData, textchat_so, chatSharedObjects);
+				//
+				//TODO: CallTransfer_Dest_Accepted	73
+				//UpdateOperatorStatus(soName.substring(8),OPERATOR_CALLTRANSFER_DEST_ACCEPTED ,chatData.getString("message").toString());
+			}
+			 
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("Transferdisconnect"))
+			{
+				
+				client.getProperties().put("IsDisconnectedByTransfer", true);   
+				client.fcUnSubscribeAll();
+				
+				chatSharedObjects.removeClient(client);
+		
+			} 
+			
+			else if(chatData.getString("messagetype").contains("NewConnection") == true || chatData.getString("messagetype").contains("TransferConnection") == true)
+			{
+				addMessageNewConnection(soName, chatData, textchat_so, chatSharedObjects);
+				
+				if(chatData.getString("messagetype").toString().equalsIgnoreCase("TransferConnection"))
+				{
+					//TODO:
+					UpdateOperatorStatus(soName.substring(8),OPERATOR_CALLTRANSFER_DEST_ABANDON ,chatData.getString("message").toString());
+					
+				}
+				
+			}
+			else if(chatData.getString("messagetype").toString().equalsIgnoreCase("SupervisorConnect"))
+			{
+				
+				
+				//soName
+				chatData.put("ClientID", new AMFDataItem(soName));
+				addMessageSupervisorConnect(soName, textchat_so);
+			}
+			else if(chatData.getString("messagetype").contains("TimeStampEnable"))
+			{
+				ISharedObject customer_so = chatSharedObjects.get(soName); 
+				
+				if(chatData.getString("message").toString().toUpperCase().equals("TRUE") || chatData.getString("message").toString().toUpperCase().equals("1"))
+				{
+					customer_so.setProperty("IsTimeSlabNeed",1);
+				}
+				else
+				{
+					customer_so.setProperty("IsTimeSlabNeed",0);
+				}
+						
+				
+			}
+			
+			else if(chatData.getString("messagetype").contains("CustomerHangUp"))
+			{
+				
+				//getLogger().info("ModuleTextChatDebug.addMessage: " + client.getClientId());
+				textchat_so.setProperty("isCustomerHangupMsgSend", true);
+				
+				
+			}
+			
+			else if(chatData.getString("messagetype").contains("OperatorHangUp"))
+			{
+				
+				//getLogger().info("ModuleTextChatDebug.addMessage: " + client.getClientId());
+				textchat_so.setProperty("isOperatorHangupMsgSend", true);
+				
+			}
+			
+			
+			else if(chatData.getString("messagetype").contains("Message"))
+			{
+					//String msg = "<b>"+ chatData.getString("user") + "</b>: " + chatData.getString("message");
+					String msg = chatData.getString("message");
+					chatData.put("message", new AMFDataItem(msg));
+					
+					String[] strgroups = msg.split(" ");
+					Pattern intsOnly = Pattern.compile("\\d*");
+					
+					for (String strObj : strgroups) {
+						Matcher makeMatch = intsOnly.matcher(strObj);
+						makeMatch.find();
+						String inputInt = makeMatch.group();
+						System.out.println(inputInt);
+					} 
+						
+					CountChatStatistics(soName,messageSender, textchat_so, msg);
+					
+					if(messageSender.contains("operatorinteraction") == true || messageSender.contains("supervisor") == true || messageSender.contains("unknown") == true)
+					{
+						chatData.put("Sender", new AMFDataItem("Agent"));
+						
+						if(textchat_so.getProperty("IsOperatorCS").toString().toUpperCase().equals("FALSE"))
+						{
+							textchat_so.setProperty("IsOperatorCS", true);
+						}
+					}
+					else
+					{
+						chatData.put("Sender", new AMFDataItem("Visitor"));
+						
+						if(textchat_so.getProperty("IsVisitorCS").toString().toUpperCase().equals("FALSE"))
+						{
+							textchat_so.setProperty("IsVisitorCS", true);
+						}
+						
+					}
+					
+					if(textchat_so.getProperty("IsOperatorCS").toString().toUpperCase().equals("TRUE") && textchat_so.getProperty("IsVisitorCS").toString().toUpperCase().equals("TRUE") && textchat_so.getProperty("CSStatus").toString().toUpperCase().equals("FALSE") )
+					{
+						textchat_so.setProperty("CSStatus", true);
+						
+						//UpdateConversattionStatus
+						if(!soName.contains("Operator"))
+							UpdateConversattionStatus(soName, textchat_so.getProperty("ChatType").toString());
+							
+							
+						getLogger().info("Update ConversationStatus");
+					}
+					
+			}
+			
+			textchat_so.setProperty(propName, chatData);
+			textchat_so.setProperty("lastChatId", new AMFDataItem(nextChatId));
+			
+			AMFDataList ChatToSave = chatUserOjects.get(soName);
+			ChatToSave.add(chatData);
+			
+			// remove old messages
+			if ((nextChatId % keepCount) == 0)
+			{
+				long startId = nextChatId - keepCount;
+				
+				while(startId > 0)
+				{
+					String delName = "chatData"+startId;
+					
+					if (textchat_so.getSlot(delName) != null)
+						textchat_so.deleteSlot(delName);
+					else
+						break;
+					
+					startId--;
+				}
+				
+				purgeDeleted(textchat_so);
+			}
+		}
+		catch(Exception e)
+		{
+			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+		}
+		finally
+		{
+			textchat_so.unlock();
+		}
+			
+	}
+ 
+	private void CountChatStatistics(String soName,String messageSender,ISharedObject textchat_so, String msg)
+	{
+		try
+		{			
+			HashMap<String, ChatStatistics> chatStatList = chatStatistics.get(soName);
+			
+			DateFormat firstFormat =  new SimpleDateFormat("MM/dd/yyyy HH");					
+			Date date = new Date();														
+			TimeZone firstTime = TimeZone.getTimeZone("Europe/London");
+			firstFormat.setTimeZone(firstTime);					
+			
+			DateFormat ResponseFormat = new SimpleDateFormat("yy/MM/dd HH:mm:ss");
+			ResponseFormat.setTimeZone(firstTime);					
+			
+			String statItemKey = "";
+			if(messageSender.contains("operatorinteraction") == true || messageSender.contains("unknown") == true)
+			{
+				statItemKey = firstFormat.format(date) + "Operator";						
+			}
+			else
+			{
+				statItemKey = firstFormat.format(date) + "Visitor";
+			}
+								
+			if(chatStatList.containsKey(statItemKey))
+			{
+				ChatStatistics chatStatsOld = chatStatList.get(statItemKey);
+				chatStatsOld.WordCount += wordcount(msg);
+				chatStatsOld.LineCount += 1;
+										
+				if(messageSender.contains("operatorinteraction") == true || messageSender.contains("unknown") == true)
+				{							
+					if(textchat_so.containsProperty("VsLastMsgTime") == true && textchat_so.containsProperty("LastMsgFrom") == true && textchat_so.getProperty("LastMsgFrom").toString() == "Visitor")
+					{
+						if (textchat_so.containsProperty("VsChatwithResp") == false)
+						{
+							chatStatsOld.ChatwithResp = 1;
+							textchat_so.setProperty("VsChatwithResp", true);
+						}
+						String dateStart = textchat_so.getProperty("VsLastMsgTime").toString();
+				        String dateStop = ResponseFormat.format(date);					        
+				        Date d1 = ResponseFormat.parse(dateStart);
+				        Date d2 = ResponseFormat.parse(dateStop);
+				        chatStatsOld.ResponseTimeInSeconds += (d2.getTime() - d1.getTime())/1000;
+				        chatStatsOld.ResponseCount += 1;
+					}							
+				}
+				else
+				{							
+					if(textchat_so.containsProperty("OpLastMsgTime") == true && textchat_so.containsProperty("LastMsgFrom") == true && textchat_so.getProperty("LastMsgFrom").toString() == "Operator")
+					{
+						if (textchat_so.containsProperty("OpChatwithResp") == false)
+						{
+							chatStatsOld.ChatwithResp = 1;
+							textchat_so.setProperty("OpChatwithResp", true);
+						}
+						String dateStart = textchat_so.getProperty("OpLastMsgTime").toString();
+				        String dateStop = ResponseFormat.format(date);					        
+				        Date d1 = ResponseFormat.parse(dateStart);
+				        Date d2 = ResponseFormat.parse(dateStop);
+				        chatStatsOld.ResponseTimeInSeconds += (d2.getTime() - d1.getTime())/1000;
+				        chatStatsOld.ResponseCount += 1;
+					}
+				}
+				// save the updated chatStat object back to the list
+				chatStatList.put(statItemKey, chatStatsOld);
+			}
+			else // if there is no matching statistics item with matching key
+			{
+				ChatStatistics chatStatsNew = new ChatStatistics();						
+				chatStatsNew.WordCount = wordcount(msg);
+				chatStatsNew.LineCount = 1;					
+				chatStatsNew.FromDate = firstFormat.format(date) + ":00:00";
+				chatStatsNew.ToDate = firstFormat.format(date) + ":59:00";						
+				
+				if(messageSender.contains("operatorinteraction") == true || messageSender.contains("unknown") == true)
+				{
+					chatStatsNew.Sender = "Operator";
+					if(textchat_so.containsProperty("VsLastMsgTime") == true && textchat_so.containsProperty("LastMsgFrom") == true && textchat_so.getProperty("LastMsgFrom").toString() == "Visitor")
+					{							
+						if (textchat_so.containsProperty("VsChatwithResp") == false)
+						{
+							chatStatsNew.ChatwithResp = 1;
+							textchat_so.setProperty("VsChatwithResp", true);
+						}
+						String dateStart = textchat_so.getProperty("VsLastMsgTime").toString();
+				        String dateStop = ResponseFormat.format(date);					        
+				        Date d1 = ResponseFormat.parse(dateStart);
+				        Date d2 = ResponseFormat.parse(dateStop);
+						chatStatsNew.ResponseTimeInSeconds = (d2.getTime() - d1.getTime())/1000;
+						chatStatsNew.ResponseCount = 1;
+					}  
+					else
+					{
+						chatStatsNew.ResponseTimeInSeconds = 0;
+						chatStatsNew.ResponseCount = 0;
+					}
+				}
+				else
+				{
+					chatStatsNew.Sender = "Visitor";
+					if(textchat_so.containsProperty("OpLastMsgTime") == true && textchat_so.containsProperty("LastMsgFrom") == true && textchat_so.getProperty("LastMsgFrom").toString() == "Operator")
+					{
+						if (textchat_so.containsProperty("OpChatwithResp") == false)
+						{
+							chatStatsNew.ChatwithResp = 1;
+							textchat_so.setProperty("OpChatwithResp", true);
+						}
+						String dateStart = textchat_so.getProperty("OpLastMsgTime").toString();
+				        String dateStop = ResponseFormat.format(date);					        
+				        Date d1 = ResponseFormat.parse(dateStart);
+				        Date d2 = ResponseFormat.parse(dateStop);
+						chatStatsNew.ResponseTimeInSeconds = (d2.getTime() - d1.getTime())/1000;
+						chatStatsNew.ResponseCount = 1;
+					}
+					else
+					{
+						chatStatsNew.ResponseTimeInSeconds = 0;
+						chatStatsNew.ResponseCount = 0;
+					}
+				}						
+				// save the updated chatStat object into the list
+				chatStatList.put(statItemKey, chatStatsNew);
+			}
+			// save the updated list of chatStats into the instance level HashMap
+			chatStatistics.put(soName, chatStatList);				
+										
+			if(messageSender.contains("operatorinteraction") == true || messageSender.contains("unknown") == true)
+			{
+				textchat_so.setProperty("OpLastMsgTime", ResponseFormat.format(date));
+				textchat_so.setProperty("LastMsgFrom", "Operator");			
+			}
+			else
+			{
+				textchat_so.setProperty("VsLastMsgTime", ResponseFormat.format(date));
+				textchat_so.setProperty("LastMsgFrom", "Visitor");							
+			}
+		}
+		catch(Exception e)
+		{
+			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+		}
+	}
+	
+	private static int wordcount(String line){
+		  int numWords = 0;
+		  int index = 0;
+		  boolean prevWhiteSpace = true;
+		  while(index < line.length()){
+		  char c = line.charAt(index++);
+		  boolean currWhiteSpace = Character.isWhitespace(c);
+		  if(prevWhiteSpace && !currWhiteSpace){
+		  numWords++;
+		  }
+		  prevWhiteSpace = currWhiteSpace;
+		  }
+		  return numWords;
+		  }	
+	private void addMessageSupervisorConnect(String soName, ISharedObject textchat_so) 
+	{
+		StringBuilder ChatToSave = new StringBuilder(""); 
+		AMFDataList CustomerChat = chatUserOjects.get(soName);
+		
+		/*
+		 * 
+		 * for (int count=0;count<CustomerChat.size();count++) {
+			AMFDataObj chatData1 = (AMFDataObj)CustomerChat.getObject(count);
+			
+			if(chatData1.getString("messagetype").contains("OperatorConnect") == true)
+			{
+				ChatToSave.append("<p>" + chatData1.getString("message") + "</p>");
+			}
+			else if(chatData1.getString("messagetype").contains("Message") == true)
+			{
+				ChatToSave.append("<p>" + chatData1.getString("message") + "</p>");
+			}
+			
+		}
+		*/
+		
+		StringBuilder ChatToSaveWithTimeStamp = new StringBuilder("");
+		
+		for (int count=0;count<CustomerChat.size();count++) {
+			AMFDataObj chatObject = (AMFDataObj)CustomerChat.getObject(count);
+			
+			/*if(chatObject.getString("messagetype").contains("PrivateMessage") == true)
+			{
+				//ChatToSave.append("<p>" + chatObject.getString("message") + "</p>");
+				ChatToSaveWithTimeStamp.append("<u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<p><font color='#FF0000'>" + chatObject.getString("message") + "</font></p>");
+				
+			}
+			else if(chatObject.getString("messagetype").contains("OperatorConnect") == true)
+			{
+				ChatToSaveWithTimeStamp.append("<u>[" + chatObject.getString("time") + "]</u> - " +  "<p><font color=\"#003399\">" + chatObject.getString("message") + "</font></p>");
+				
+			}
+			else if(chatObject.getString("messagetype").contains("PushURL") == true)
+			{
+				ChatToSaveWithTimeStamp.append("<u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<p><font color=\"#003399\">Operator sent a </font><u><a href=\"javascript:DisplayPushURL('" + chatObject.getString("message") + "');\"><font color=\"000099\">link</font></a></u></p>");
+				
+			}
+			else if(chatObject.getString("messagetype").contains("Message") == true)
+			{
+				ChatToSaveWithTimeStamp.append("<u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<p><font color='#003399'>" + chatObject.getString("message") + "</font></p>");
+				
+			}*/
+			
+			
+			if(chatObject.getString("messagetype").contains("PrivateMessage") == true)
+			{
+				//ChatToSave.append("<p>" + chatObject.getString("message") + "</p>");
+				ChatToSaveWithTimeStamp.append("<span> <u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#FF0000'>" + chatObject.getString("message") + "</font></span></br>");
+				
+			}
+			else if(chatObject.getString("messagetype").contains("OperatorConnect") == true)
+			{
+				ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " +  "<font color=\"#003399\">" + chatObject.getString("message") + "</font></span></br>");
+				
+			}
+			else if(chatObject.getString("messagetype").contains("PushURL") == true)
+			{
+				//ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color=\"#003399\">Operator sent a </font><u><a href=\"javascript:DisplayPushURL('" + chatObject.getString("message") + "');\"><font color=\"000099\">link</font></a></u></span></br>");
+				ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+			}
+			else if(chatObject.getString("messagetype").contains("Message") == true)
+			{
+				ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+				
+			}
+			
+			
+		}
+		
+		
+		textchat_so.setProperty("HistoryChat", ChatToSaveWithTimeStamp.toString());
+	}
+
+	private void addMessageNewConnection(String soName, AMFDataObj chatData, ISharedObject textchat_so, ISharedObjects chatSharedObjects) 
+	{
+		String CustomerSoName = chatData.getString("message");
+		String CustomerName = "";
+		String OperatorName = "";
+		OperatorName = textchat_so.getProperty("UserName").toString();
+		
+		
+		
+		ISharedObject customer_so = chatSharedObjects.get(CustomerSoName);
+		if(customer_so!=null) 
+		{
+			CustomerName = customer_so.getProperty("UserName").toString();
+			
+			
+			
+			String OperatorID = soName.substring(8);
+			chatData.put("user", CustomerName);
+			
+				synchronized (customer_so) {
+						customer_so.setProperty("OperatorID", OperatorID);
+						customer_so.setProperty("OperatorName", OperatorName);	
+			}
+			
+			
+			//
+		}
+		
+		//
+	}
+
+	private void addMessageTransferConnection(String soName, AMFDataObj chatData, ISharedObject textchat_so, ISharedObjects chatSharedOjects) 
+	{
+		String CustomerSoName = chatData.getString("message");
+		String CustomerName = "";
+		String OperatorName = "";
+		
+		ISharedObject customer_so = chatSharedOjects.get(CustomerSoName);
+		
+		CustomerName = customer_so.getProperty("UserName").toString();
+		OperatorName = textchat_so.getProperty("UserName").toString();
+		
+		if(customer_so!=null)
+		{
+			StringBuilder ChatToSaveWithTimeStamp = new StringBuilder("");
+			StringBuilder ChatToSaveWithoutTimeStamp = new StringBuilder("");
+			AMFDataList CustomerChat = chatUserOjects.get(CustomerSoName);
+			
+			for (int count=0;count<CustomerChat.size();count++) {
+				AMFDataObj chatObject = (AMFDataObj)CustomerChat.getObject(count);
+				
+				if(chatObject.getString("messagetype").contains("PrivateMessage") == true)
+				{
+					//ChatToSave.append("<p>" + chatObject.getString("message") + "</p>");
+					ChatToSaveWithTimeStamp.append("<span> <u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#FF0000'>" + chatObject.getString("message") + "</font></span></br>");
+					ChatToSaveWithoutTimeStamp.append("<span><b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#FF0000'>" + chatObject.getString("message") + "</font></span></br>");
+				}
+				else if(chatObject.getString("messagetype").contains("OperatorConnect") == true)
+				{
+					ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " +  "<font color=\"#003399\">" + chatObject.getString("message") + "</font></span></br>");
+					ChatToSaveWithoutTimeStamp.append("<span><font color=\"#003399\">" + chatObject.getString("message") + "</font></span></br>");
+				}
+				else if(chatObject.getString("messagetype").contains("PushURL") == true)
+				{
+					//ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color=\"#003399\">Operator sent a </font><u><a href=\"javascript:DisplayPushURL('" + chatObject.getString("message") + "');\"><font color=\"000099\">link</font></a></u></span></br>");
+					//ChatToSaveWithoutTimeStamp.append("<span><b> " + chatObject.getString("user")  + "</b>: " +  "<font color=\"#003399\">Operator sent a </font><u><a href=\"javascript:DisplayPushURL('" + chatObject.getString("message") + "');\"><font color=\"000099\">link</font></a></u></span></br>");
+					ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+					ChatToSaveWithoutTimeStamp.append("<span><b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+				}
+				else if(chatObject.getString("messagetype").contains("Message") == true)
+				{
+					ChatToSaveWithTimeStamp.append("<span><u>[" + chatObject.getString("time") + "]</u> - " + "<b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+					ChatToSaveWithoutTimeStamp.append("<span><b> " + chatObject.getString("user")  + "</b>: " +  "<font color='#003399'>" + chatObject.getString("message") + "</font></span></br>");
+				}
+				
+			}
+			
+			customer_so.setProperty("TransferInitiated", "true");
+			customer_so.setProperty("TransferredChatWithTimeStamp", ChatToSaveWithTimeStamp.toString());
+			customer_so.setProperty("TransferredChatWithoutTimeStamp", ChatToSaveWithoutTimeStamp.toString());
+			customer_so.setProperty("TransferAccepted", false);
+			customer_so.setProperty("TransferTo", "");
+			customer_so.setProperty("IsChatTransferred", true);
+			customer_so.setProperty("ChatTransferred", true);
+			
+			String TransferOperatorID = soName.substring(8);
+			String CurrentOperatorID = customer_so.getProperty("OperatorID").toString();
+			
+			chatData.put("user", CustomerName);
+			
+			synchronized (customer_so) {
+			
+				//customer_so.setProperty("OperatorID", TransferOperatorID);
+				//customer_so.setProperty("OperatorName", OperatorName);
+				
+				customer_so.setProperty("TransferOperatorID", TransferOperatorID);
+				customer_so.setProperty("TransferOperatorName", OperatorName);
+				
+			}
+			
+			
+			String CurrentOperator = "Operator" + CurrentOperatorID;
+			String TransferredOperator = "Operator" + TransferOperatorID;
+			
+			ISharedObject CurrentOperator_so = chatSharedOjects.get(CurrentOperator);
+			ISharedObject TransferredOperator_so = chatSharedOjects.get(TransferredOperator);
+			
+			if(TransferredOperator_so.containsProperty("IsTimeSlabNeed"))
+			{
+				customer_so.setProperty("IsTimeSlabNeed", TransferredOperator_so.getProperty("IsTimeSlabNeed").toString());
+			}
+			if(TransferredOperator_so != null)
+			{
+				//Transferred operator status
+				if(TransferredOperator_so.containsProperty("OperatorIncall")== false)
+				{
+					UpdateOperatorStatus(TransferOperatorID, OPERATOR_INCALL_STATE, CustomerSoName);
+					TransferredOperator_so.setProperty("OperatorIncall", 1);
+				}
+				else
+				{
+					double ActivecustomerCount = Double.parseDouble(TransferredOperator_so.getProperty("OperatorIncall").getValue().toString());
+					ActivecustomerCount ++; 
+					if(ActivecustomerCount == 1.0)
+					{
+						UpdateOperatorStatus(TransferOperatorID, OPERATOR_INCALL_STATE, CustomerSoName);				
+					}
+					TransferredOperator_so.setProperty("OperatorIncall",ActivecustomerCount );
+				}
+				UpdateOperatorStatus(TransferOperatorID, OPERATOR_CALLSTARTED_TRANSFERRED_STATE, CustomerSoName);
+			}
+			TransferCall(CurrentOperatorID, TransferOperatorID, CustomerSoName);
+		}
+	}
+
+	private void addMessageTransferAccept(AMFDataObj chatData, ISharedObjects chatSharedObjects ,ISharedObject textchat_so)
+	{
+		String CustomerSoName = chatData.getString("message");
+		ISharedObject customer_so = chatSharedObjects.get(CustomerSoName);
+
+		if(customer_so!=null)
+		{
+			if(customer_so.containsProperty("OperatorTransferred") == false)
+			{
+				customer_so.setProperty("OperatorTransferred", true);
+			}
+			customer_so.setProperty("TransferAccepted", "true");
+			customer_so.setProperty("TransferTo", chatData.getString("transferringoperator"));
+			//IsChatTransferred
+			customer_so.setProperty("IsChatTransferred", "true");
+			customer_so.setProperty("ChatTransferred", "true");
+		}
+	}
+
+	private void addMessageOperatorReject(String soName, AMFDataObj chatData,
+		ISharedObject textchat_so) {
+		String OperatorID = textchat_so.getProperty("OperatorID").toString();
+		chatData.put("OperatorId", new AMFDataItem(OperatorID));
+		RejectCall(soName);
+	}
+
+	private void addMessageOperatorConnect(IClient client, ISharedObjects chatSharedObjects,String soName, AMFDataObj chatData, ISharedObject textchat_so) 
+	{
+		String OperatorID = textchat_so.getProperty("OperatorID").toString();
+		ISharedObject customer_so = chatSharedObjects.get(soName);
+				
+		
+		getLogger().info("ModuleTextChatDebug.addMessageOperatorConnect : OperatorID " + OperatorID);
+		
+		
+		chatData.put("OperatorId", new AMFDataItem(OperatorID));
+		AcceptCall(soName, Integer.parseInt(OperatorID));
+		ISharedObject operator_so = client.getAppInstance().getSharedObjects().get("Operator" + OperatorID);
+		//if(!customer_so.containsProperty("IsChatTransferred") || (customer_so.containsProperty("IsChatTransferred") && customer_so.getProperty("IsChatTransferred").toString() == "false") )
+		if(customer_so.getProperty("IsChatTransferred").toString() == "false" &&  customer_so.getProperty("TransferredFlag").toString() == "false" )
+		{
+			
+			//getLogger().info("ModuleTextChatDebug.addMessageOperatorConnect : IsChatTransferred " + customer_so.getProperty("IsChatTransferred").toString() );
+		// set the other properties on operator shared object and update his activity in database
+		if(operator_so.containsProperty("OperatorIncall")== false )
+		{
+			UpdateOperatorStatus(OperatorID, OPERATOR_INCALL_STATE, soName);
+			operator_so.setProperty("OperatorIncall", 1);
+		}
+		else
+		{
+			double ActivecustomerCount = Double.parseDouble(operator_so.getProperty("OperatorIncall").getValue().toString());
+			ActivecustomerCount ++; 
+			if(ActivecustomerCount == 1.0)
+			{
+				UpdateOperatorStatus(OperatorID, OPERATOR_INCALL_STATE, soName);				
+			}
+			operator_so.setProperty("OperatorIncall",ActivecustomerCount );
+		}
+		//TransferAccepted
+			UpdateOperatorStatus(OperatorID, OPERATOR_CALLSTARTED_STATE, soName);
+		}
+		//customer_so.setProperty("IsChatTransferred", false);
+		
+		customer_so.setProperty("TransferredFlag", false);
+	}
+	
+	private void purgeDeleted(ISharedObject textchat_so)
+	{
+		int purge = textchat_so.getVersion()-purgeCount;
+		if (purge > 0)
+			textchat_so.purge(purge);
+	}
+	
+	public void clearMessages(IClient client, RequestFunction function, AMFDataList params)
+	{
+		String soName = params.getString(PARAM1);
+		while(true)
+		{
+			ISharedObject textchat_so = getChatSharedObject(soName, "", client,"");			
+			if (textchat_so == null)
+				break;
+			textchat_so.lock();
+			try
+			{
+				textchat_so.clear();
+				purgeDeleted(textchat_so);
+			}
+			catch(Exception e)
+			{
+				getLogger().error("ModuleTextChatDebug.clearMessages: "+e.toString());
+			}
+			finally
+			{
+				textchat_so.unlock();
+			}
+			break;
+		}
+	}
+	
+	public void onConnect(IClient client, RequestFunction function,
+			AMFDataList params) {
+			
+			getLogger().info("ModuleTextChatDebug.onConnect: " + client.getClientId());
+	}
+	
+	public void onDisconnect(IClient client) {
+		
+		 
+		getLogger().info("ModuleTextChatDebug.onDisconnect: " + client.getClientId());
+		getLogger().info("ModuleTextChatDebug.onDisconnect: " + client.getPageUrl());
+		
+		String soName = client.getSharedObjectReadAccess();
+		
+		//String soName = client.getProperties().getPropertyStr("soName");
+		getLogger().info("ModuleTextChatDebug.onDisconnect: soName " + soName);
+		ISharedObjects chatSharedObjects = client.getAppInstance().getSharedObjects();
+		ISharedObject textchat_so = chatSharedObjects.get(soName);
+		
+		String disconnectingUserURL = client.getPageUrl().toLowerCase();
+		if(disconnectingUserURL=="unknown")
+		{
+			String From= textchat_so.getProperty("RequestFrom").toString();
+			if(From.contains("null")== true)
+			{
+				disconnectingUserURL="operatorinteraction";
+			}
+			else if(From.contains("supervisor")== true)
+			{
+				disconnectingUserURL="supervisor";
+			}
+		}
+		
+		if(disconnectingUserURL.contains("customerinteraction")== true){
+			
+			  
+			if(textchat_so != null)
+			{
+				
+				Boolean ishangup  = Boolean.parseBoolean(textchat_so.getProperty("isCustomerHangupMsgSend").toString())  ;
+				
+				getLogger().info("ModuleTextChatDebug.onDisconnect: isCustomerHangup " + ishangup  );
+				 
+				//Send notification
+				if(!ishangup){
+					String UserName   = textchat_so.getProperty("UserName").toString();
+					AMFDataObj amfDataObj = new AMFDataObj();
+					amfDataObj.put("message", new AMFDataItem(UserName + " left the conversation"));
+					amfDataObj.put("time", new java.util.Date());
+					amfDataObj.put("user", new AMFDataItem(UserName));
+					amfDataObj.put("messagetype", new AMFDataItem("CustomerHangUp"));
+					
+					AMFDataList list = new AMFDataList();
+					list.add("addMessage");
+					list.add(0.0);
+					list.add("null");
+					list.add(soName);
+					list.add(amfDataObj);
+		
+					addMessage(client, null, list);
+				}
+				 
+				//remove client from shared object
+				textchat_so.removeClient(client);
+			}
+			 
+			
+		}
+		
+		else if(disconnectingUserURL.contains("operatorinteraction")== true || disconnectingUserURL.contains("unknown")== true){
+			
+			// Visitor SO disconnected from Agent console
+			if(!soName.contains("Operator"))
+			{
+				
+				Boolean ishangup  = Boolean.parseBoolean(textchat_so.getProperty("isOperatorHangupMsgSend").toString())  ;
+				getLogger().info("ModuleTextChatDebug.onDisconnect: isOperatorHangup " + ishangup  );
+				
+				if(textchat_so != null)
+				{
+					  
+					//UdateOperatorStatusByHangUp(chatSharedObjects,OperatorChatSo,customer_so, OperatorID, soName);
+					
+					Boolean IsChatTransfered = Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString()) ;
+					
+					String OperatorID = "";
+					String operatorSO = "";
+					if(IsChatTransfered){
+						OperatorID = textchat_so.getProperty("OperatorID").toString();
+						
+						synchronized (textchat_so) {
+							textchat_so.setProperty("OperatorID", textchat_so.getProperty("TransferOperatorID").toString());
+							}
+						
+					}else{
+						OperatorID = textchat_so.getProperty("OperatorID").toString();
+							
+					} 
+					 
+					operatorSO = "Operator" + OperatorID;
+					
+					ISharedObject operator_so = null;
+					//ISharedObject customer_so = null;
+					
+					operator_so = chatSharedObjects.get(operatorSO);
+					
+					UdateOperatorStatusByHangUp(chatSharedObjects,operator_so,textchat_so, OperatorID, soName);
+					synchronized (textchat_so) {
+						//textchat_so.setProperty("OperatorID", textchat_so.getProperty("TransferOperatorID").toString());
+						//textchat_so.setProperty("IsChatTransferred", false);	
+						
+						textchat_so.setProperty("IsChatTransferred", false);
+						textchat_so.setProperty("TransferredFlag", true);
+					}
+					
+					SaveChatHistory(client, chatSharedObjects, textchat_so);
+					 
+					if(ishangup)
+					{
+						//normal hang up from Agent side
+						
+						PerformCallQueueCleanup(soName);
+						//remove SO count from connetected 
+						
+						String ConnectedVisitorSO = "";
+						if(operator_so != null)
+						{
+							
+							for (String strvisitorso : operator_so.getProperty("ConnectedVisitorSO").toString().split(",")) {
+								
+								if(strvisitorso.equalsIgnoreCase(soName))
+								{
+									Double TotalConnectedVisitor =Double.parseDouble(operator_so.getProperty("TotalVistorConnetected").toString());
+									if(TotalConnectedVisitor > 0)
+									{
+										TotalConnectedVisitor--;
+										
+										synchronized (operator_so) {
+											operator_so.setProperty("TotalVistorConnetected", TotalConnectedVisitor);	
+											
+										}
+										
+									}
+									
+									getLogger().info("ModuleTextChatDebug.onDisconnect: TotalVistorConnetected " + TotalConnectedVisitor  );
+								}else{
+									ConnectedVisitorSO += strvisitorso + ",";
+								}
+							}
+								
+							if(ConnectedVisitorSO.length() > 1)
+							{
+								ConnectedVisitorSO = ConnectedVisitorSO.substring(0, ConnectedVisitorSO.length()-1);
+								
+							}
+							
+							synchronized (operator_so) {
+								operator_so.setProperty("ConnectedVisitorSO", ConnectedVisitorSO);
+								
+							}
+							
+							getLogger().info("ModuleTextChatDebug.onDisconnect: strConnectedVisitorSO " + ConnectedVisitorSO  );
+						}
+						
+					}else
+					{
+						
+						boolean isTransferDisconnect  = client.getProperties().getPropertyBoolean("IsDisconnectedByTransfer", false);
+						boolean IsChatTransferred = Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString());
+						
+						getLogger().info("ModuleTextChatDebug.onDisconnect: isTransferDisconnect " + isTransferDisconnect  );
+						getLogger().info("ModuleTextChatDebug.onDisconnect: IsChatTransferred " + IsChatTransferred  );
+						
+						//textchat_so.setProperty("IsChatTransferred", true);
+						//boolean isTransferDisconnect =Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString()) ; 
+						if(!isTransferDisconnect && !IsChatTransferred){
+						
+							//browser close by Agent and visitor disoconneted
+						
+							String UserName   = textchat_so.getProperty("UserName").toString();
+							AMFDataObj amfDataObj = new AMFDataObj();
+							amfDataObj.put("message", new AMFDataItem(UserName + " left the conversation"));
+							amfDataObj.put("time", new java.util.Date());
+							amfDataObj.put("user", new AMFDataItem(UserName));
+							amfDataObj.put("messagetype", new AMFDataItem("OperatorHangUp"));
+							
+							AMFDataList list = new AMFDataList();
+							list.add("addMessage");
+							list.add(0.0);
+							list.add("null");
+							list.add(soName);
+							list.add(amfDataObj);
+				
+							addMessage(client, null, list);
+							
+							PerformCallQueueCleanup(soName);
+						}
+					}
+					
+				
+					
+				}
+				
+			}
+			else
+			{
+				// Agent SO disconnetected
+				 
+				
+				OperatorDisconnect(soName);
+				
+				/*Double TotalConnectedVisitor =Double.parseDouble(textchat_so.getProperty("TotalVistorConnetected").toString());
+				while (TotalConnectedVisitor != 0) {
+					try {
+						Thread.sleep(1000);
+					} catch (InterruptedException e) {
+						// TODO Auto-generated catch block
+						e.printStackTrace();
+					}
+				}*/
+				
+			}
+					
+		}
+		
+		else if(disconnectingUserURL.contains("supervisor")== true){
+			
+			// Visitor SO disconnected from Agent console
+			
+			if(!soName.contains("Operator") && textchat_so != null)
+			{
+				Boolean issupchat  = Boolean.parseBoolean(textchat_so.getProperty("IsSupervisorChat").toString())  ;
+				getLogger().info("ModuleTextChatDebug.onDisconnect: isSupervisorChat " + issupchat  );
+				
+				Boolean ishangup  = Boolean.parseBoolean(textchat_so.getProperty("isOperatorHangupMsgSend").toString())  ;
+				getLogger().info("ModuleTextChatDebug.onDisconnect: isOperatorHangup " + ishangup  );
+				
+				if(issupchat==true)
+				{
+					  
+					//UdateOperatorStatusByHangUp(chatSharedObjects,OperatorChatSo,customer_so, OperatorID, soName);
+					
+					Boolean IsChatTransfered = Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString()) ;
+					
+					String OperatorID = "";
+					String operatorSO = "";
+					if(IsChatTransfered){
+						OperatorID = textchat_so.getProperty("OperatorID").toString();
+						
+						synchronized (textchat_so) {
+							textchat_so.setProperty("OperatorID", textchat_so.getProperty("TransferOperatorID").toString());
+							}
+						
+					}else{
+						OperatorID = textchat_so.getProperty("OperatorID").toString();
+							
+					} 
+					 
+					operatorSO = "Operator" + OperatorID;
+					
+					ISharedObject operator_so = null;
+					//ISharedObject customer_so = null;
+					
+					operator_so = chatSharedObjects.get(operatorSO);
+					
+					UdateOperatorStatusByHangUp(chatSharedObjects,operator_so,textchat_so, OperatorID, soName);
+					synchronized (textchat_so) {
+						//textchat_so.setProperty("OperatorID", textchat_so.getProperty("TransferOperatorID").toString());
+						//textchat_so.setProperty("IsChatTransferred", false);	
+						
+						textchat_so.setProperty("IsChatTransferred", false);
+						textchat_so.setProperty("TransferredFlag", true);
+					}
+					
+					SaveChatHistory(client, chatSharedObjects, textchat_so);
+					 
+					if(ishangup)
+					{
+						//normal hang up from Agent side
+						
+						PerformCallQueueCleanup(soName);
+						//remove SO count from connetected 
+						
+						String ConnectedVisitorSO = "";
+						if(operator_so != null)
+						{
+							
+							for (String strvisitorso : operator_so.getProperty("ConnectedVisitorSO").toString().split(",")) {
+								
+								if(strvisitorso.equalsIgnoreCase(soName))
+								{
+									Double TotalConnectedVisitor =Double.parseDouble(operator_so.getProperty("TotalVistorConnetected").toString());
+									if(TotalConnectedVisitor > 0)
+									{
+										TotalConnectedVisitor--;
+										
+										synchronized (operator_so) {
+											operator_so.setProperty("TotalVistorConnetected", TotalConnectedVisitor);	
+											
+										}
+										
+									}
+									
+									getLogger().info("ModuleTextChatDebug.onDisconnect: TotalVistorConnetected " + TotalConnectedVisitor  );
+								}else{
+									ConnectedVisitorSO += strvisitorso + ",";
+								}
+							}
+								
+							if(ConnectedVisitorSO.length() > 1)
+							{
+								ConnectedVisitorSO = ConnectedVisitorSO.substring(0, ConnectedVisitorSO.length()-1);
+								
+							}
+							
+							synchronized (operator_so) {
+								operator_so.setProperty("ConnectedVisitorSO", ConnectedVisitorSO);
+								
+							}
+							
+							getLogger().info("ModuleTextChatDebug.onDisconnect: strConnectedVisitorSO " + ConnectedVisitorSO  );
+						}
+						
+					}else
+					{
+						
+						boolean isTransferDisconnect  = client.getProperties().getPropertyBoolean("IsDisconnectedByTransfer", false);
+						boolean IsChatTransferred = Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString());
+						
+						getLogger().info("ModuleTextChatDebug.onDisconnect: isTransferDisconnect " + isTransferDisconnect  );
+						getLogger().info("ModuleTextChatDebug.onDisconnect: IsChatTransferred " + IsChatTransferred  );
+						
+						//textchat_so.setProperty("IsChatTransferred", true);
+						//boolean isTransferDisconnect =Boolean.parseBoolean(textchat_so.getProperty("IsChatTransferred").toString()) ; 
+						if(!isTransferDisconnect && !IsChatTransferred){
+						
+							//browser close by Agent and visitor disoconneted
+						
+							String UserName   = textchat_so.getProperty("UserName").toString();
+							AMFDataObj amfDataObj = new AMFDataObj();
+							amfDataObj.put("message", new AMFDataItem(UserName + " left the conversation"));
+							amfDataObj.put("time", new java.util.Date());
+							amfDataObj.put("user", new AMFDataItem(UserName));
+							amfDataObj.put("messagetype", new AMFDataItem("OperatorHangUp"));
+							
+							AMFDataList list = new AMFDataList();
+							list.add("addMessage");
+							list.add(0.0);
+							list.add("null");
+							list.add(soName);
+							list.add(amfDataObj);
+				
+							addMessage(client, null, list);
+							
+							PerformCallQueueCleanup(soName);
+						}
+					}
+					
+				
+					
+				}
+				
+			}
+			else
+			{
+				// Agent SO disconnetected
+				 
+				
+				OperatorDisconnect(soName);
+				
+				/*Double TotalConnectedVisitor =Double.parseDouble(textchat_so.getProperty("TotalVistorConnetected").toString());
+				while (TotalConnectedVisitor != 0) {
+					try {
+						Thread.sleep(1000);
+					} catch (InterruptedException e) {
+						// TODO Auto-generated catch block
+						e.printStackTrace();
+					}
+				}*/
+				
+			}
+					
+		}
+		
+		
+		getLogger().info("ModuleTextChatDebug.onDisconnect: shared object connected client : " + textchat_so.getRefCount());
+		if(textchat_so.getRefCount() == 1){
+		
+			chatSharedObjects.remove(soName);
+			
+			
+			getLogger().info("ModuleTextChatDebug.onDisconnect: removed shared object : " + soName );
+		}
+		
+		
+	}
+
+	public void UdateOperatorStatusByHangUp(ISharedObjects chatSharedObjects,ISharedObject OperatorChatSo, ISharedObject customer_so,String OperatorID,String soName )
+	{
+		if(OperatorChatSo != null && OperatorChatSo.containsProperty("OperatorIncall")== true)
+		{
+			//ISharedObject customerso = chatSharedObjects.get(soName);
+			getLogger().info("ModuleTextChatDebug.UdateOperatorStatusByHangUp: : IsChatTransferred "+customer_so.containsProperty("IsChatTransferred"));
+			if(customer_so.containsProperty("IsChatTransferred") && customer_so.getProperty("IsChatTransferred").toString() == "true")
+				UpdateOperatorStatus(OperatorID, OPERATOR_CALLCOMPLETED_TRANSFERRED_STATE, soName);
+			else
+				UpdateOperatorStatus(OperatorID, OPERATOR_CALLHANGUP_STATE, soName);
+			
+			double ActivecustomerCount = Double.parseDouble(OperatorChatSo.getProperty("OperatorIncall").getValue().toString());
+			ActivecustomerCount --; 
+			
+			if(ActivecustomerCount < 0)
+				ActivecustomerCount = 0;
+			
+			OperatorChatSo.setProperty("OperatorIncall",ActivecustomerCount );
+			
+			if(ActivecustomerCount < 1)
+			{
+				UpdateOperatorStatus(OperatorID, OPERATOR_OUTCALL_STATE, soName);				
+			}
+		}
+	}
+	
+	public void SaveChatHistory(IClient client,ISharedObjects chatSharedObjects,ISharedObject disconnectingChatSo)
+	{
+		StringBuilder ChatToSave = new StringBuilder("");
+		String soName = client.getSharedObjectReadAccess();
+		AMFDataList CustomerChat = chatUserOjects.get(soName);
+		boolean isOperatorConnected = false; 
+		boolean hasCustomerSentMessage = false;
+		boolean hasOperatorSentMessage = false;
+		int isInteractiveChat = 0;
+		
+		String UserName = null;
+		if(disconnectingChatSo.containsProperty("UserName")){
+			UserName = disconnectingChatSo.getProperty("UserName").toString();
+		}
+		String OperatorName = null;
+		if(disconnectingChatSo.containsProperty("OperatorName")){
+		 OperatorName = disconnectingChatSo.getProperty("OperatorName").toString();
+		}
+		ISharedObject ret = null;
+		ret = chatSharedObjects.getOrCreate(soName);
+		
+		ChatToSave.append("<ChatHistory>");
+	   for (int count=0;count<CustomerChat.size();count++) {
+		   
+		   AMFDataObj chatData = (AMFDataObj)CustomerChat.getObject(count);
+		if(!chatData.getString("messagetype").equalsIgnoreCase("CustomerTyping") && !chatData.getString("messagetype").equalsIgnoreCase("CustomerTypingWords") && !chatData.getString("messagetype").equalsIgnoreCase("OperatorTyping") && !chatData.getString("messagetype").equalsIgnoreCase("TimeStampEnable") && !chatData.getString("messagetype").equalsIgnoreCase("CustomerVideoStatus") && !chatData.getString("messagetype").equalsIgnoreCase("OperatorVideoStatus"))
+		{
+			ChatToSave.append("<MessageContent>");
+			ChatToSave.append("<MessageType>");
+			ChatToSave.append(chatData.getString("messagetype"));
+			ChatToSave.append("</MessageType>");
+			ChatToSave.append("<TimeZone>");	
+			if(ret.containsProperty("timeZoneName"))
+			{
+				ChatToSave.append(ret.getProperty("timeZoneName"));	
+			}
+			else
+			{
+				ChatToSave.append("GMT");
+			}
+			ChatToSave.append("</TimeZone>");
+						
+			ChatToSave.append("<TimeStamp>");
+			ChatToSave.append(chatData.getString("time"));
+			ChatToSave.append("</TimeStamp>");
+			
+			ChatToSave.append("<Message>");
+			ChatToSave.append("<![CDATA[");
+			//ChatToSave.append(chatData.getString("message"));
+			String strMsg = chatData.getString("message");					
+			
+			String strMask = "";
+			
+			for(int i=0;i< strMsg.length();i++)
+			{
+				char ch = strMsg.charAt(i);
+				
+		       
+		        switch (ch) {
+		            case '1': 
+		            strMask += "*";
+		                     break;
+		            case '2':  
+		            strMask += "*";
+		                     break;
+		            case '3': 
+		            	 strMask += "*";
+		                     break;
+		            case '4':  
+		            	 strMask += "*";
+		                     break;
+		            case '5':  
+		            	 strMask += "*";
+		                     break;
+		            case '6':  
+		            	 strMask += "*";
+		                     break;
+		            case '7':  
+		            	 strMask += "*";
+		                     break;
+		            case '8':  
+		            	 strMask += "*";
+		                     break;
+		            case '9':  
+		            	 strMask += "*";
+		                     break;
+		            case '0': 
+		            	 strMask += "*";
+		                     break;
+		            
+		            default:  strMask += ch;
+		                     break;
+		        }
+
+			}
+			
+			
+			ChatToSave.append(strMask);
+			
+			ChatToSave.append("]]>");
+			
+			ChatToSave.append("</Message>");
+			ChatToSave.append("<SenderName>");
+			ChatToSave.append(chatData.getString("user"));
+			ChatToSave.append("</SenderName>");
+			
+			ChatToSave.append("<Sender>");
+			ChatToSave.append(chatData.getString("Sender"));
+			ChatToSave.append("</Sender>");
+			
+			if(chatData.getString("messagetype").contains("OperatorConnect") == true)
+			{
+				//ChatToSave.append("<p>" + chatData.getString("message") + "</p>");
+				//ChatToSave.append("<MessageContent>");
+				isOperatorConnected = true;
+			}
+			/*else if(chatData.getString("messagetype").contains("OperatorHangUp") == true)
+			{
+				//ChatToSave.append("<p>" + chatData.getString("message") + "</p>");
+			}
+			else if(chatData.getString("messagetype").contains("OperatorHangUp") == true)
+			{
+				//ChatToSave.append("<p>" + chatData.getString("message") + "</p>");
+			}*/
+			else if(chatData.getString("messagetype").contains("CustomerHangUp") == true)
+			{
+				//ChatToSave.append("<p>" + chatData.getString("message") + "</p>");
+				isOperatorConnected = false;
+			}
+			else if(chatData.getString("messagetype").contains("Message") == true)
+			{
+				//ChatToSave.append("<p>" + chatData.getString("message") + "</p>");
+				
+				if(chatData.getString("user").contains(UserName) == true)
+				{
+					hasCustomerSentMessage = true;
+				}
+				else if(OperatorName != null && chatData.getString("user").contains(OperatorName) ==  true)
+				{
+					hasOperatorSentMessage = true;
+				}
+			}
+			
+			if(hasCustomerSentMessage && hasOperatorSentMessage)
+			{
+				isInteractiveChat = 1;
+			}
+			
+			ChatToSave.append("</MessageContent>");
+		}
+	}
+		
+		ChatToSave.append("</ChatHistory>");
+		int i = 0;
+		HashMap<String, ChatStatistics> chatStatList = chatStatistics.get(soName);
+		Iterator<ChatStatistics> iterator =  chatStatList.values().iterator();
+		ChatStatistics chatstats;
+		while (iterator.hasNext())					
+		{						
+			chatstats=iterator.next();
+			if (i == 0)
+				AddChatStatistics(soName, chatstats.Sender,  chatstats.WordCount, chatstats.LineCount, chatstats.FromDate, chatstats.ToDate, chatstats.ResponseTimeInSeconds,1, chatstats.ChatwithResp, chatstats.ResponseCount);
+			else
+				AddChatStatistics(soName, chatstats.Sender,  chatstats.WordCount, chatstats.LineCount, chatstats.FromDate, chatstats.ToDate, chatstats.ResponseTimeInSeconds,0, chatstats.ChatwithResp, chatstats.ResponseCount);
+			i = i+1;
+		}		
+				
+		
+		CustomerDisconnect(soName, ChatToSave, isInteractiveChat);
+		/*ISharedObject chat_so = getChatSharedObject(soName, "", client,"");
+			synchronized (chat_so) {
+				if(!isOperatorConnected)
+				{
+					chat_so.setProperty("PrematureCustomerHangUp", "true");
+					// perform call queue clean
+					PerformCallQueueCleanup(soName);
+				}
+				chatSharedObjects.remove(soName);
+				chat_so.release();
+				chatUserOjects.remove(soName);
+			} 
+		
+		CustomerDisconnect(soName, ChatToSave, isInteractiveChat); */
+	}
+	
+	public void onAppStop(IApplicationInstance appInstance) 
+	{
+		ISharedObjects chatSharedObjects = appInstance.getSharedObjects();
+		synchronized(chatSharedObjects)
+		{
+			Iterator<String> iter = chatSharedObjects.getObjectNames().iterator();
+			while(iter.hasNext())
+			{ 
+				String soName = iter.next();
+				getLogger().info("ModuleTextChatDebug.onAppStop: release shared object: "+soName);
+				chatSharedObjects.remove(soName);
+			}
+		}
+	}
+	
+	private String GetOperator(String CustomerSoName)
+	{
+		CallableStatement cstmt = null;
+		String strOperatorID = "0";
+		Connection con = null;
+		
+	    try {
+ 
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{? = call usp_AssignOperator(?)}");
+	      cstmt.registerOutParameter(1, java.sql.Types.INTEGER);
+	      cstmt.setString(2,CustomerSoName);
+	      
+	      cstmt.execute();
+	      
+          strOperatorID = cstmt.getString(1);
+          
+          getLogger().info("Returned Operator ID: "+strOperatorID);
+	      
+	      cstmt.close();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	  
+		return strOperatorID;
+	}
+	
+	private void PerformCallQueueCleanup(String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection conn = null;
+		try{
+			SQLServerDataSource ds = GetSQLDataSource();
+			
+			conn = ds.getConnection();
+			
+			cstmt = conn.prepareCall("{call usp_tbl_CallQueueCleanupByGuid(?)}");
+			cstmt.setString(1, Guid);
+			
+			cstmt.execute();
+		}
+		catch(SQLException e){
+			getLogger().error("ModuleTextChatDebug.performCallQueueCleanup: "+ e.toString());
+		}finally{
+			try{
+				conn.close();
+			}catch(SQLException e){
+				getLogger().error("ModuleTextChatDebug.performCallQueueCleanup: " + e.toString());
+			}
+		}
+	}
+	
+	private void AcceptCall(String Guid, int OperatorID)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_AcceptCall(?,?)}");
+	      cstmt.setString(1, Guid);
+	      cstmt.setInt(2, OperatorID);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	}
+	
+	private void RejectCall(String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_RejectCall(?)}");
+	      cstmt.setString(1, Guid);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	}
+	
+	private void DeleteOrphanQueue(String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_DeleteOrphanQueue(?)}");
+	      cstmt.setString(1, Guid);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.DeleteOrphanQueue: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.DeleteOrphanQueue: "+e.toString());
+			}
+	    }
+	}
+	
+	private void OperatorDisconnect(String soName)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		String OperatorID = soName.substring(8);
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_DisconnectOperatorNew(?,?)}");
+	      cstmt.setString(1, OperatorID);
+	      cstmt.setInt(2, OPERATOR_LOGOUT_STATE);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	}
+	
+	private void CustomerDisconnect(String Guid, StringBuilder ChatTranscript, int isInteractiveChat)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_DisconnectCall(?,?,?)}");
+	      cstmt.setString(1, Guid);
+	      cstmt.setString(2, ChatTranscript.toString());
+	      cstmt.setInt(3, isInteractiveChat);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	}
+	
+	private void TransferCall(String CurrentOperatorId, String TransferOperatorId, String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_TransferChatNew(?,?,?)}");
+	      
+	      cstmt.setInt(1, Integer.parseInt(CurrentOperatorId));
+	      cstmt.setInt(2, Integer.parseInt(TransferOperatorId));
+	      cstmt.setString(3, Guid);
+	      
+	      cstmt.execute();
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	}
+	
+	private String GetDefaultGreeting(String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		String message = null;
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_GetGreetingBySubCustomerID(?,?)}");
+	      
+	      cstmt.setString(1, Guid);
+	      cstmt.registerOutParameter(2, java.sql.Types.VARCHAR);
+	      
+	      cstmt.execute();
+	      
+	      message = cstmt.getString(2);
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	    return message;
+	}
+	
+	private String[] GetTimeZone(Integer UserID)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		String message[] = new String[2];
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call GetTimeZoneByOperatorID(?,?,?)}");
+	      
+	      cstmt.setInt(1, UserID);
+	      cstmt.registerOutParameter(2, java.sql.Types.VARCHAR);
+	      cstmt.registerOutParameter(3, java.sql.Types.BIT);
+	      
+	      cstmt.execute();
+	      
+	      message[0] = cstmt.getString(2);
+	      message[1] = cstmt.getString(3);
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	    return message;
+	}
+	
+	private void AddChatStatistics(String Guid, String Sender, int WordCount, int LineCount, String FromDate, String ToDate, long ResponseTimeinSec, int ChatStarted, int ChatWithResp, int ResCount)
+	{
+		CallableStatement cstmt = null;
+		Connection conn = null;
+		try{
+			SQLServerDataSource ds = GetSQLDataSource();
+			
+			conn = ds.getConnection();
+			
+			cstmt = conn.prepareCall("{call usp_InsUpdChatAverages(?,?,?,?,?,?,?,?,?,?)}");
+			
+			cstmt.setString("Guid", Guid);
+			cstmt.setString("Sender", Sender);
+			cstmt.setInt("WordCount",WordCount);
+			cstmt.setInt("LineCount", LineCount);		
+			cstmt.setString("FromDate", FromDate);			
+			cstmt.setString("ToDate", ToDate);
+			cstmt.setLong("ResTimeinSec",ResponseTimeinSec);
+			cstmt.setInt("ResCount",ResCount);				
+			cstmt.setInt("ChatStarted",ChatStarted);				
+			cstmt.setInt("ChatWithResp",ChatWithResp);
+			
+			cstmt.execute();
+		}
+		catch(SQLException e){
+			getLogger().error("ModuleTextChatDebug.performCallQueueCleanup: "+ e.toString());
+		}finally{
+			try{
+				conn.close();
+			}catch(SQLException e){
+				getLogger().error("ModuleTextChatDebug.performCallQueueCleanup: " + e.toString());
+			}
+		}
+	}
+	
+	private void UpdateOperatorStatus(String strOperatorID,Integer OperatorStatus,String Guid)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_UpdateOperatorStatusNew(?,?,?)}");
+	      
+	      cstmt.setInt(1, Integer.parseInt(strOperatorID));
+	      cstmt.setInt(2, OperatorStatus);
+	      cstmt.setString(3, Guid);
+	      	      
+	      cstmt.execute();
+	            
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	    
+	}
+	
+	private void UpdateConversattionStatus(String Guid, String ChatType)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_UpdateConversationStatus(?,?)}");
+	      
+	      
+	      cstmt.setString(1, Guid);
+	      if(ChatType == "undefined" || ChatType == "null" || ChatType == null)
+	    	  ChatType = "";	      
+	      cstmt.setString(2, ChatType);	      	      
+	      cstmt.execute();
+	            
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	    
+	}
+	
+	private void OperatorUpdate(Integer UserID, String clientIP)
+	{
+		CallableStatement cstmt = null;
+		Connection con = null;
+		
+	    try {
+
+	      // Setting up the DataSource object
+	      com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	        = GetSQLDataSource();
+	       
+	      // Getting a connection object
+	      con = ds.getConnection();
+	      
+	      cstmt = con.prepareCall("{call usp_usersUpdateNew(?,?,?,?)}");
+	      
+	      cstmt.setInt(1,UserID);
+	      cstmt.setString(2,OPERATOR_LOGIN_STATE.toString());
+	      cstmt.setString(3, clientIP);
+	      cstmt.setString(4,OPERATOR_NOT_IN_CALL);
+	      	      
+	      cstmt.execute();
+	            
+	    } 
+	    catch (Exception e) 
+	    {
+	    	getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+	    }
+	    finally
+	    {
+    		try {
+				con.close();
+			} 
+    		catch (SQLException e) 
+			{
+    			getLogger().error("ModuleTextChatDebug.addMessage: "+e.toString());
+			}
+	    }
+	    
+	}
+	
+	private com.microsoft.sqlserver.jdbc.SQLServerDataSource GetSQLDataSource()
+	{
+				  
+   		
+		/*com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	  	= new com.microsoft.sqlserver.jdbc.SQLServerDataSource();
+	  ds.setServerName("10.0.0.136");
+		
+	  ds.setDatabaseName("eChatDebug");
+	  ds.setUser("etechchat");
+	  ds.setPassword("etechchat1?");*/ 
+	
+		
+		
+		com.microsoft.sqlserver.jdbc.SQLServerDataSource  ds 
+	  	= new com.microsoft.sqlserver.jdbc.SQLServerDataSource();
+	  ds.setServerName("et3ebs6117A");
+		
+
+	  ds.setDatabaseName("eChatDebug");
+	  ds.setUser("sa");
+	  ds.setPassword("effective1?"); 
+
+	  return ds;
+	}
+}

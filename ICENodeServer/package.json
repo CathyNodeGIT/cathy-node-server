@@ -1,0 +1,23 @@
+{
+  "name": "hello_world",
+  "description": "hello world test app",
+  "version": "0.0.1",
+  "private": true,
+  "dependencies": {
+    "express": "3.3.8",
+    "mysql": "2.0.0-alpha9",
+    "ws": "~0.4.31",
+    "socket.io": "~0.9.16",
+    "redis": "~0.10.1",
+    "mssql": "~0.5.0",
+    "connect-redis": "~1.4.7",
+    "session.socket.io": "~0.1.6",
+    "connect": "~2.14.1",
+    "socket.io-clusterhub": "~0.2.0",
+    "chromelogger": "~1.1.1",
+    "cookie": "~0.1.1"
+  },
+  "scripts": {
+    "start": "node ./app.js"
+  }
+}
